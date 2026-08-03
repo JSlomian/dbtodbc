@@ -24,13 +24,23 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     endif()
 endif()
 
+option(DBTODBC_STATIC "Statically link MariaDB client and MinGW runtime (fully standalone dbtodbc.exe)" OFF)
+
 find_path(MARIADB_INCLUDE_DIR
     NAMES mysql.h
     PATH_SUFFIXES mariadb mysql
 )
-find_library(MARIADB_LIBRARY
-    NAMES mariadbclient libmariadb mariadb libmysql mysqlclient
-)
+
+if(DBTODBC_STATIC)
+    find_library(MARIADB_LIBRARY
+        NAMES libmariadbclient.a mariadbclient
+        NAMES_PER_DIR
+    )
+else()
+    find_library(MARIADB_LIBRARY
+        NAMES mariadbclient libmariadb mariadb libmysql mysqlclient
+    )
+endif()
 
 if(NOT MARIADB_INCLUDE_DIR OR NOT MARIADB_LIBRARY)
     message(FATAL_ERROR
@@ -43,6 +53,7 @@ endif()
 
 message(STATUS "MariaDB include dir: ${MARIADB_INCLUDE_DIR}")
 message(STATUS "MariaDB library: ${MARIADB_LIBRARY}")
+message(STATUS "DBTODBC_STATIC: ${DBTODBC_STATIC}")
 
 add_executable(dbtodbc
     src/main.cpp
@@ -66,7 +77,18 @@ target_include_directories(dbtodbc PRIVATE
 target_link_libraries(dbtodbc PRIVATE ${MARIADB_LIBRARY})
 
 if(WIN32)
-    target_link_libraries(dbtodbc PRIVATE ws2_32 secur32 bcrypt)
+    target_link_libraries(dbtodbc PRIVATE ws2_32 secur32 bcrypt crypt32)
+endif()
+
+if(DBTODBC_STATIC AND WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # curl is linked dynamically on purpose: MariaDB Connector/C's static archive
+    # was built against curl's import lib (its optional remote-config-fetch
+    # feature), so its symbols are already baked in as dllimport - only a curl
+    # DLL can satisfy them, no matter what we pass on our own link line.
+    find_library(CURL_DYNAMIC_LIBRARY NAMES libcurl.dll.a curl.dll.a REQUIRED)
+
+    target_link_options(dbtodbc PRIVATE -static-libgcc -static-libstdc++ -static -lwinpthread)
+    target_link_libraries(dbtodbc PRIVATE ssl crypto z zstd iconv shlwapi ${CURL_DYNAMIC_LIBRARY})
 endif()
 
 add_executable(roundtrip_test

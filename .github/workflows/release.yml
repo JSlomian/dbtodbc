@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up MSYS2 UCRT64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            zip
+            base-devel
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-lld
+            mingw-w64-ucrt-x86_64-libmariadbclient
+            mingw-w64-ucrt-x86_64-curl
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-zstd
+            mingw-w64-ucrt-x86_64-libiconv
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDBTODBC_STATIC=ON
+
+      - name: Build
+        run: cmake --build build --target dbtodbc -j
+
+      - name: Verify static link (only curl should remain dynamic)
+        run: |
+          set -e
+          EXE=build/dbtodbc.exe
+          echo "== objdump -p (direct import DLL list) =="
+          objdump -p "$EXE" | grep -i "DLL Name" || true
+          # MariaDB Connector/C's static archive was itself built against curl's
+          # import lib (its optional remote-config-fetch feature), so libcurl-4.dll
+          # is expected to remain a dynamic dependency. Everything else (libstdc++,
+          # libgcc, libwinpthread, the MariaDB client, ssl/crypto/z/zstd/iconv) must
+          # be statically embedded - if any of those show up here, static link failed.
+          BAD=$(objdump -p "$EXE" | grep -i "DLL Name" | grep -viE \
+            "KERNEL32|USER32|ADVAPI32|WS2_32|SECUR32|BCRYPT|CRYPT32|WLDAP32|SSPICLI|SHLWAPI|SHELL32|ole32|GDI32|RPCRT4|IPHLPAPI|ntdll|msvcrt|api-ms-win|libcurl-4\.dll" \
+            || true)
+          if [ -n "$BAD" ]; then
+            echo "Unexpected dynamic dependency found, static link failed:"
+            echo "$BAD"
+            exit 1
+          fi
+          echo "OK: dbtodbc.exe is static aside from libcurl-4.dll and standard Windows system DLLs."
+
+      - name: Stage release asset
+        run: |
+          set -e
+          mkdir -p dist
+          cp build/dbtodbc.exe dist/dbtodbc.exe
+          cp README.md dist/README.md
+          # Bundle curl's own runtime DLL chain (curl links dynamically - see the
+          # verify step above) by resolving the full transitive closure with ldd
+          # and copying every dependency that lives under /ucrt64/bin (i.e. isn't
+          # a Windows system DLL) next to the exe.
+          ldd build/dbtodbc.exe \
+            | grep -oE '/ucrt64/bin/[^ ]+\.dll' \
+            | sort -u \
+            | xargs -I{} cp {} dist/
+          echo "Bundled runtime DLLs:"
+          ls dist/*.dll
+          cd dist && zip -r ../dbtodbc-${{ github.ref_name }}-win64.zip .
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dbtodbc-${{ github.ref_name }}-win64.zip
+          generate_release_notes: true
